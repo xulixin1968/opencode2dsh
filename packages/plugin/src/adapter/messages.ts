@@ -46,6 +46,13 @@ export interface HarnessGenerateOptions {
 
 /** pi-ai message vocabulary (subset we emit). */
 export type PiMessage =
+  | {
+      /** Leading system message carrying the prompt and the harness tool set. */
+      role: 'system'
+      content: string
+      toolsAdded?: PiTool[]
+      timestamp: number
+    }
   | { role: 'user'; content: string | PiContentBlock[]; timestamp: number }
   | {
       role: 'assistant'
@@ -81,10 +88,126 @@ export interface PiTool {
   parameters: unknown
 }
 
+/**
+ * pi-ai Context. The system prompt and the tool set ride a LEADING
+ * `role: 'system'` message when the installed pi-ai reads that message, and the
+ * `systemPrompt` / `tools` context fields when it reads those fields instead.
+ * The two shapes are NOT interchangeable:
+ *
+ * - A message-shaped pi-ai reads the prompt and tools only from a leading
+ *   `role: 'system'` message (`utils/transcript.js createInitialSystemMessage`,
+ *   `api/openai-completions.js` `i === 0 ? getSystemMessageText(msg)`).
+ *   `Context.systemPrompt` / `Context.tools` are gone from the api layer --
+ *   `grep systemPrompt` over `dist/api/` hits only `normalizeContext`, which
+ *   this adapter never triggers (it dispatches straight to the api layer
+ *   through `createProvider(...).streamSimple`). So on that shape, putting the
+ *   prompt in the fields loses it silently.
+ * - A context-shaped pi-ai does the opposite: `convertMessages` has no `system`
+ *   branch, so a leading system MESSAGE is dropped, and `utils/estimate.js`
+ *   `estimateMessageTokens` iterates `message.content` as blocks, so a
+ *   string-content system message throws
+ *   `Cannot read properties of undefined (reading 'length')`.
+ *
+ * Emitting both shapes at once would double the system prompt and, on a
+ * context-shaped pi-ai, throw before the request is even sent.
+ * {@link piAiTranscriptShape} picks one from the capability the installed pi-ai
+ * exposes, so the adapter works against any version of it.
+ */
 export interface PiContext {
-  systemPrompt?: string
   messages: PiMessage[]
+  /** Read by context-shaped pi-ai; on a message-shaped pi-ai nothing reads it. */
+  systemPrompt?: string
+  /** Read by context-shaped pi-ai; on a message-shaped pi-ai nothing reads it. */
   tools?: PiTool[]
+}
+
+/**
+ * Which pi-ai transcript shape this process must speak: `'message'` when the
+ * installed pi-ai reads the prompt and tools from a leading `role: 'system'`
+ * message, or `'context'` when it reads them from `Context.systemPrompt` /
+ * `Context.tools`.
+ *
+ * Detected by capability, never by version number, so a future pi-ai release
+ * needs no change here. The probe is anchored on `getSystemMessageText` -- the
+ * function pi-ai's own api layer calls to read that leading message -- because
+ * it is the reader itself: it exists in every version that needs the message
+ * shape and in no version that needs the context shape. Checked against every
+ * published version this package's range accepts, 0.82.1 through 1.0.2.
+ */
+export type PiTranscriptShape = 'message' | 'context'
+
+let cachedShape: PiTranscriptShape | undefined
+
+/**
+ * A pi-ai that cannot be loaded leaves the transcript shape unknown, and the
+ * two shapes fail in opposite ways: on a message-shaped pi-ai a context
+ * transcript silently drops the prompt and the tool set, while on a
+ * context-shaped pi-ai a leading system message throws inside
+ * `estimateMessageTokens` before a request goes out. Failing to load the
+ * dependency cannot be resolved in favour of either, so it is surfaced instead
+ * of guessed.
+ */
+export class PiAiShapeUnknownError extends Error {
+  constructor(cause: unknown) {
+    super(
+      'cannot determine the pi-ai transcript shape: @earendil-works/pi-ai did not load. ' +
+        'Its transcript shape has to be known because the prompt and the tool set ' +
+        'live in different places in the two shapes.',
+      { cause },
+    )
+    this.name = 'PiAiShapeUnknownError'
+  }
+}
+
+/**
+ * Probe the installed pi-ai for the transcript shape it reads. The root entry
+ * point is imported through the root specifier rather than a
+ * `@earendil-works/pi-ai/utils/transcript` subpath, because that subpath only
+ * exists from 0.86 on, and the nine versions below 0.86 are the ones the probe
+ * has to answer 'context' for. The package root is the one specifier every
+ * version this range accepts exports. Resolved once per process, and cached --
+ * the answer cannot change under a live process.
+ */
+/** Loads the installed pi-ai root entry point. Injected in tests. */
+export type PiAiModuleLoader = () => Promise<{ getSystemMessageText?: unknown }>
+
+/**
+ * The probe itself, with the loader injected so both answers and the
+ * load-failure path can be exercised against a fabricated pi-ai rather than
+ * only against whichever version happens to be installed.
+ */
+export async function probePiAiTranscriptShape(
+  load: PiAiModuleLoader = () => import('@earendil-works/pi-ai') as Promise<{ getSystemMessageText?: unknown }>,
+): Promise<PiTranscriptShape> {
+  let piAi: { getSystemMessageText?: unknown }
+  try {
+    piAi = await load()
+  } catch (error) {
+    throw new PiAiShapeUnknownError(error)
+  }
+  return typeof piAi.getSystemMessageText === 'function' ? 'message' : 'context'
+}
+
+export async function piAiTranscriptShape(
+  report?: (message: string) => void,
+): Promise<PiTranscriptShape> {
+  if (cachedShape !== undefined) return cachedShape
+  cachedShape = await probePiAiTranscriptShape()
+  // A wrong answer here is silent by construction: the pi-ai that got it wrong
+  // drops the prompt and the tool set and still answers, plausibly. The line
+  // below is the only signal that names the shape, so it is emitted once per
+  // process, on the turn that first needs it. Without it, an export renamed
+  // without the shape changing is a support ticket with nothing to read.
+  report?.(
+    `opencode2dsh: pi-ai reads the ${cachedShape} transcript shape; ` +
+      `the prompt and tool set are carried there this turn`,
+  )
+  return cachedShape
+}
+
+/** Test seam: forget the cached {@link piAiTranscriptShape} probe. */
+export function resetPiAiTranscriptShape(): void {
+  cachedShape = undefined
 }
 
 export function zeroUsage(): PiUsage {
@@ -235,8 +358,26 @@ function flattenText(message: HarnessMessage): string {
  * messages keep text AND image blocks (images load from the harness
  * attachment store); tool results as toolResult messages, assistant history as
  * pi-ai assistant messages. Async because image bytes are read from disk.
+ *
+ * The harness system prompt and tool set go into the transcript in whichever
+ * shape the installed pi-ai reads, decided by {@link piAiTranscriptShape}.
+ * {@link PiContext} explains why emitting both would be wrong.
  */
-export async function toPiContext(options: HarnessGenerateOptions): Promise<PiContext> {
+export async function toPiContext(
+  options: HarnessGenerateOptions,
+  report?: (message: string) => void,
+): Promise<PiContext> {
+  return toPiContextWithLoader(options, () => piAiTranscriptShape(report))
+}
+
+/**
+ * {@link toPiContext} with the shape probe injected, so a test can drive the
+ * path where pi-ai does not load at all.
+ */
+export async function toPiContextWithLoader(
+  options: HarnessGenerateOptions,
+  probe: () => Promise<PiTranscriptShape>,
+): Promise<PiContext> {
   const providerId = options.provider
   const toolNames = new Map<string, string>()
   const messages: PiMessage[] = []
@@ -281,11 +422,41 @@ export async function toPiContext(options: HarnessGenerateOptions): Promise<PiCo
       })
     }
   }
-  const context: PiContext = { messages }
-  if (typeof options.system === 'string' && options.system.length > 0) context.systemPrompt = options.system
-  const tools = options.tools?.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters }))
-  if (tools && tools.length > 0) context.tools = tools
-  return context
+  const system = typeof options.system === 'string' ? options.system : ''
+  const tools: PiTool[] = (options.tools ?? [])
+    .map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters }))
+  return applyPiTranscriptShape(messages, system, tools, await probe())
+}
+
+/**
+ * Put the harness prompt and tool set into `messages` in the shape the
+ * installed pi-ai reads. Split out from {@link toPiContext} so both shapes are
+ * reachable in tests regardless of which pi-ai version is installed.
+ *
+ * - `'message'`: a leading `role: 'system'` message holding the prompt text
+ *   and `toolsAdded`. Omitted entirely when prompt and tools are both empty,
+ *   matching `createInitialSystemMessage` returning `undefined`.
+ * - `'context'`: the prompt and tool set go into the context fields instead. A
+ *   leading system message would be dropped by `convertMessages`, which has no
+ *   `system` branch, and its string `content` would crash `estimateMessageTokens`.
+ */
+export function applyPiTranscriptShape(
+  messages: PiMessage[],
+  system: string,
+  tools: PiTool[],
+  shape: PiTranscriptShape,
+): PiContext {
+  if (shape === 'context') {
+    const context: PiContext = { messages }
+    if (system.length > 0) context.systemPrompt = system
+    if (tools.length > 0) context.tools = tools
+    return context
+  }
+  const head: PiMessage[] =
+    system.length > 0 || tools.length > 0
+      ? [{ role: 'system', content: system, ...(tools.length > 0 ? { toolsAdded: tools } : {}), timestamp: 0 }]
+      : []
+  return { messages: [...head, ...messages] }
 }
 
 /**

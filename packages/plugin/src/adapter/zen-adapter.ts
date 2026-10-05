@@ -113,17 +113,20 @@ export function reasoningEfforts(capability: { reasoning: boolean; effortValues:
 }
 
 /**
- * The `reasoning_effort` wire value for a selected effort id. The Zen gateway
- * validates the field against `minimal|low|medium|high|xhigh|max|none`
- * (live-probed 2026-09-18: any other value is a hard 400), and `none` is the
- * only spelling that stops the always-think free models from thinking — a
- * mere omission keeps the provider default. So `off` maps to wire `none`,
- * ladder levels pass through verbatim, and unknown ids (never advertised)
- * inject nothing rather than risk the 400.
+ * The `reasoning_effort` wire value for a selected effort id.
+ *
+ * Live-probed 2026-10-04 against the Zen free lane: the gateway accepts
+ * `minimal|low|medium|high|xhigh|max` and rejects `none` and `off` with a hard
+ * 400. So the wire has no way to spell "do not think", and an omitted field is
+ * the only safe encoding. Ladder levels pass through verbatim, `off` is dropped
+ * rather than translated, and unknown ids inject nothing rather than risk the
+ * 400. Re-probe before changing this; the earlier comment here claimed `none`
+ * was the one accepted spelling of "off" and was wrong on both halves.
  */
 export function reasoningEffortWire(id: string | undefined): string | undefined {
   if (id === undefined) return undefined
-  if (id === 'off') return 'none'
+  // 'off' is deliberately not translated: every wire spelling for it is a 400.
+  if (id === 'off') return undefined
   return (REASONING_EFFORT_LADDER as readonly string[]).includes(id) ? id : undefined
 }
 
@@ -263,6 +266,7 @@ export class ZenAdapter {
   readonly #firstEventMs: number
   readonly #bodyIdleMs: number
   readonly #responsesBodyIdleMs: number
+  readonly #report: (message: string) => void
 
   constructor(catalog: CatalogLike, options: {
     zenBaseUrl?: string
@@ -272,7 +276,10 @@ export class ZenAdapter {
     bodyIdleMs?: number
     /** Overrides RESPONSES_BODY_IDLE_MS (watchdog tests inject short ones). */
     responsesBodyIdleMs?: number
+    /** Diagnostics sink for the one-off transcript-shape line. */
+    report?: (message: string) => void
   } = {}) {
+    this.#report = options.report ?? (() => {})
     this.#catalog = catalog
     this.#firstEventMs = options.firstEventMs ?? DEFAULT_FIRST_EVENT_MS
     this.#bodyIdleMs = options.bodyIdleMs ?? DEFAULT_BODY_IDLE_MS
@@ -460,7 +467,7 @@ export class ZenAdapter {
    * failure is not exit-shaped) = the original stream surface untouched.
    */
   async *#streamAttempt(options: HarnessGenerateOptions, onTerminal?: (message: PiDoneMessage) => void): AsyncGenerator<HarnessChunk> {
-    const context = await toPiContext(options)
+    const context = await toPiContext(options, this.#report)
     const ids = deriveRequestIDs(options.messages)
     const model = toPiModel(options.model, this.#catalog.reasoningCapability(options.model)?.reasoning === true, this.#catalog.limits?.(options.model), this.#catalog.modalities?.(options.model))
     // IP-pool routing context (docs/ip-pool.md 3.3): pi-ai builds the request
@@ -663,8 +670,8 @@ export class ZenAdapter {
     // serialized body right before dispatch — plain-chat contexts carry no
     // tools and the anonymous lane 403s every body without bash+read. The same
     // seam carries the selected reasoning effort: pi-ai has no option with the
-    // wire semantics this lane needs (selected off must SEND `none`, not omit),
-    // so the effort rides the payload rewrite instead.
+    // wire semantics this lane needs, so the effort rides the payload rewrite
+    // instead. With no effort to inject the hook stays the plain gate shaper.
     const onPayload =
       isResponses
         ? (payload: unknown): unknown => {

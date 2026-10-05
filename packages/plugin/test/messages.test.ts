@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { ensureFreeLaneShape, toPiContext, type HarnessGenerateOptions, type HarnessMessage, type PiMessage } from '../src/adapter/messages.ts'
+import { applyPiTranscriptShape, ensureFreeLaneShape, PiAiShapeUnknownError, piAiTranscriptShape, probePiAiTranscriptShape, resetPiAiTranscriptShape, toPiContext, toPiContextWithLoader, type HarnessGenerateOptions, type HarnessMessage, type PiMessage } from '../src/adapter/messages.ts'
 
 function expectAssistant(message: PiMessage | undefined): Extract<PiMessage, { role: 'assistant' }> {
   assert.equal(message?.role, 'assistant')
@@ -14,6 +14,31 @@ function expectAssistant(message: PiMessage | undefined): Extract<PiMessage, { r
 function expectRole(message: PiMessage | undefined, role: PiMessage['role']): PiMessage {
   assert.equal(message?.role, role)
   return message as PiMessage
+}
+
+/**
+ * pi-ai only exports the system-message reader from 0.86 on, so the reader is
+ * reached through a structural type and looked up at runtime. PiTool.parameters
+ * is `unknown` in this plugin, so PiMessage is deliberately wider than pi-ai's
+ * own Message, and the reader wants the narrow shape.
+ */
+type SystemMessageLike = { role: string; content: unknown; toolsAdded?: unknown; timestamp: number }
+const systemMessageReader = (piAi: Record<string, unknown>): ((message: SystemMessageLike) => string) | undefined => {
+  const reader = piAi.getSystemMessageText
+  return typeof reader === 'function' ? (reader as (message: SystemMessageLike) => string) : undefined
+}
+async function loadNormalizeContext(): Promise<((context: unknown) => { messages: SystemMessageLike[] }) | undefined> {
+  // `./utils/*` is not in 0.82's exports map, so this import is dynamic and
+  // legitimately fails there; the caller treats that as "no fold to test". The
+  // specifier is held in a variable so the compiler does not try to resolve a
+  // subpath the installed pi-ai may not publish.
+  const specifier = `${'@earendil-works'}/pi-ai/utils/transcript`
+  try {
+    const mod = await import(specifier) as unknown as { normalizeContext: (context: unknown) => { messages: SystemMessageLike[] } }
+    return mod.normalizeContext
+  } catch {
+    return undefined
+  }
 }
 
 function options(overrides: Partial<HarnessGenerateOptions> = {}): HarnessGenerateOptions {
@@ -41,16 +66,45 @@ async function putObject(home: string, sha: string, bytes: Buffer): Promise<void
   await writeFile(join(dir, sha), bytes)
 }
 
-test('system messages become leading user text', async () => {
+test('system prompt and in-transcript system text ride a leading system message', async () => {
+  const shape = await piAiTranscriptShape()
   const context = await toPiContext(
     options({
       system: 'be helpful',
       messages: [{ role: 'system', content: [{ type: 'text', text: 'be helpful' }] }],
     }),
   )
+  if (shape === 'message') {
+    assert.equal(context.messages.length, 2)
+    assert.deepEqual(context.messages[0], { role: 'system', content: 'be helpful', timestamp: 0 })
+    assert.equal(context.messages[0]?.role, 'system')
+    assert.equal('systemPrompt' in context, false, 'Context.systemPrompt is gone in pi-ai 0.87')
+    assert.deepEqual(context.messages[1], { role: 'user', content: 'be helpful', timestamp: 0 })
+    return
+  }
+  // The context shape has no system message: the prompt rides the field, and
+  // in-transcript system text still has to become a leading message or nothing
+  // will read it.
+  assert.equal('systemPrompt' in context, true)
   assert.equal(context.systemPrompt, 'be helpful')
+})
+
+test('the leading system message carries the tool set as toolsAdded', async () => {
+  const shape = await piAiTranscriptShape()
+  const tools = [{ name: 'shell', description: 'run', parameters: { type: 'object' } }]
+  const context = await toPiContext(options({ system: 'sys', tools }))
+  if (shape === 'message') {
+    assert.equal(context.messages.length, 1)
+    assert.deepEqual(context.messages[0], { role: 'system', content: 'sys', toolsAdded: tools, timestamp: 0 })
+    return
+  }
+  assert.deepEqual(context.tools, tools)
+})
+
+test('no system prompt and no tools means no leading message', async () => {
+  const context = await toPiContext(options({ messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] }))
   assert.equal(context.messages.length, 1)
-  assert.deepEqual(context.messages[0], { role: 'user', content: 'be helpful', timestamp: 0 })
+  assert.equal(context.messages[0]?.role, 'user')
 })
 
 test('tool results become toolResult messages with the name from the prior toolCall', async () => {
@@ -307,11 +361,139 @@ test('a missing attachment object degrades to a readable placeholder', async () 
   })
 })
 
-test('tools pass through and empty tool lists are omitted', async () => {
-  const withTools = await toPiContext(options({ tools: [{ name: 'shell', description: 'run', parameters: { type: 'object' } }] }))
-  assert.deepEqual(withTools.tools, [{ name: 'shell', description: 'run', parameters: { type: 'object' } }])
+test('tools ride the leading system message and empty tool lists are omitted', async () => {
+  const shape = await piAiTranscriptShape()
+  const tool = { name: 'shell', description: 'run', parameters: { type: 'object' } }
+  const withTools = await toPiContext(options({ tools: [tool] }))
+  if (shape === 'message') {
+    assert.equal('tools' in withTools, false, 'Context.tools is gone in pi-ai 0.87')
+    assert.deepEqual(withTools.messages[0], { role: 'system', content: '', toolsAdded: [tool], timestamp: 0 })
+  } else {
+    assert.deepEqual(withTools.tools, [tool])
+  }
   const withoutTools = await toPiContext(options())
-  assert.equal(withoutTools.tools, undefined)
+  if (shape === 'message') {
+    assert.equal(withoutTools.messages.length, 0)
+  } else {
+    assert.equal('tools' in withoutTools, false, 'empty tool lists are omitted')
+  }
+})
+
+test("applyPiTranscriptShape 'message' folds prompt and tools into a leading system message", () => {
+  const tools = [{ name: 'shell', description: 'run', parameters: { type: 'object' } }]
+  const context = applyPiTranscriptShape([{ role: 'user', content: 'hi', timestamp: 0 }], 'sys', tools, 'message')
+  assert.equal(context.messages.length, 2)
+  assert.deepEqual(context.messages[0], { role: 'system', content: 'sys', toolsAdded: tools, timestamp: 0 })
+  assert.equal('systemPrompt' in context, false)
+  assert.equal('tools' in context, false)
+})
+
+test("applyPiTranscriptShape 'message' omits the leading message when prompt and tools are empty", () => {
+  const context = applyPiTranscriptShape([{ role: 'user', content: 'hi', timestamp: 0 }], '', [], 'message')
+  assert.deepEqual(context.messages, [{ role: 'user', content: 'hi', timestamp: 0 }])
+})
+
+test("applyPiTranscriptShape 'context' uses the 0.82 context fields and never a system message", () => {
+  const tools = [{ name: 'shell', description: 'run', parameters: { type: 'object' } }]
+  const context = applyPiTranscriptShape([{ role: 'user', content: 'hi', timestamp: 0 }], 'sys', tools, 'context')
+  assert.deepEqual(context.messages, [{ role: 'user', content: 'hi', timestamp: 0 }])
+  assert.equal(context.systemPrompt, 'sys')
+  assert.deepEqual(context.tools, tools)
+})
+
+test("applyPiTranscriptShape 'context' omits empty prompt and tool fields", () => {
+  const context = applyPiTranscriptShape([], '', [], 'context')
+  assert.equal('systemPrompt' in context, false)
+  assert.equal('tools' in context, false)
+})
+
+test('piAiTranscriptShape picks the shape the installed pi-ai can actually read back', async () => {
+  resetPiAiTranscriptShape()
+  const shape = await piAiTranscriptShape()
+  assert.equal(await piAiTranscriptShape(), shape, 'the probe is cached')
+
+  // Oracle is the library, not the probe's own condition: feed the transcript
+  // the probe chose to the reader pi-ai ships and require the prompt to come
+  // back. A probe that answered 'message' on a context-only pi-ai, or the
+  // reverse, loses the prompt here instead of silently.
+  const context = applyPiTranscriptShape([{ role: 'user', content: 'hi', timestamp: 0 }], 'THE_PROMPT', [], shape)
+  const piAi = await import('@earendil-works/pi-ai') as unknown as Record<string, unknown>
+  const readSystem = systemMessageReader(piAi)
+  const [leading] = context.messages as unknown as SystemMessageLike[]
+  if (shape === 'message') {
+    assert.notEqual(readSystem, undefined, 'a message shape implies the reader is exported')
+    assert.equal(leading!.role, 'system', 'the message shape leads with the system message the reader reads')
+    assert.equal(readSystem!(leading!), 'THE_PROMPT')
+  } else {
+    assert.equal(context.systemPrompt, 'THE_PROMPT', 'the context shape carries the prompt where 0.82 reads it')
+  }
+})
+
+test('the probed shape is reported once per process, on the turn that needs it', async () => {
+  // The reason this line exists: a probe that answers wrong is silent by
+  // construction, because the pi-ai that got it wrong still answers the turn.
+  // So the line has to fire exactly once, and not on a cached read, or the
+  // signal either disappears or becomes noise nobody reads.
+  resetPiAiTranscriptShape()
+  const seen: string[] = []
+  await toPiContext(options({ system: 'sys' }), (message) => seen.push(message))
+  assert.equal(seen.length, 1, `expected one line, got ${JSON.stringify(seen)}`)
+  const shape = await piAiTranscriptShape()
+  assert.match(seen[0]!, new RegExp(`reads the ${shape} transcript shape`))
+  await toPiContext(options({ system: 'sys' }), (message) => seen.push(message))
+  assert.equal(seen.length, 1, 'a cached probe must not report a second time')
+})
+
+test('the probe reads the shape off the loader and needs no version list', async () => {
+  // The probe is the whole mechanism, so both answers are pinned against a
+  // fabricated pi-ai instead of against whichever version is installed. A
+  // probe that was later rewritten to compare version numbers could not pass
+  // this: it would have to know what version the stub claims to be.
+  assert.equal(await probePiAiTranscriptShape(async () => ({ getSystemMessageText: () => 'x' })), 'message')
+  assert.equal(await probePiAiTranscriptShape(async () => ({})), 'context')
+  // The real export is a function on 0.86+, so a stub that exports something
+  // else under that name must not be mistaken for the reader.
+  assert.equal(await probePiAiTranscriptShape(async () => ({ getSystemMessageText: 'not a function' })), 'context')
+})
+
+test('a pi-ai that will not load surfaces as PiAiShapeUnknownError', async () => {
+  // Guessing a shape here would drop the prompt silently on the versions that
+  // need 'message', which is the failure the probe exists to prevent.
+  const cause = new Error('ERR_MODULE_NOT_FOUND')
+  await assert.rejects(
+    () => probePiAiTranscriptShape(async () => { throw cause }),
+    (error: unknown) => {
+      assert.ok(error instanceof PiAiShapeUnknownError, `expected PiAiShapeUnknownError, got ${String(error)}`)
+      assert.match((error as PiAiShapeUnknownError).message, /did not load/)
+      assert.equal((error as PiAiShapeUnknownError).cause, cause, 'the import failure is kept as the cause')
+      return true
+    },
+  )
+})
+
+test('toPiContext propagates the shape-unknown failure instead of guessing', async () => {
+  // Swallowing this would fall back to the pre-fix hard-coded shape, which is
+  // the bug this PR removes. Driven through the real probe with a loader that
+  // fails, so the wiring from toPiContext to the thrown error is covered and not
+  // just the probe in isolation.
+  const unloadable = () => probePiAiTranscriptShape(async () => { throw new Error('ERR_MODULE_NOT_FOUND') })
+  await assert.rejects(() => toPiContextWithLoader(options({ system: 'sys' }), unloadable), PiAiShapeUnknownError)
+})
+
+test('piAiTranscriptShape answers the same way through a folded transcript', async () => {
+  // The other regime consumes the folded form, so the probe has to agree with
+  // what the reader sees after the fold rather than with the input alone.
+  resetPiAiTranscriptShape()
+  const shape = await piAiTranscriptShape()
+  const normalizeContext = await loadNormalizeContext()
+  if (shape !== 'message' || normalizeContext === undefined) return
+  const readSystem = systemMessageReader(await import('@earendil-works/pi-ai') as unknown as Record<string, unknown>)
+  assert.notEqual(readSystem, undefined, 'a message shape implies the reader is exported')
+  const folded = normalizeContext(
+    applyPiTranscriptShape([{ role: 'user', content: 'hi', timestamp: 0 }], 'THE_PROMPT', [], shape),
+  )
+  assert.equal(folded.messages.filter((m) => m.role === 'system').length, 1, 'the fold must not duplicate the prompt')
+  assert.equal(readSystem!(folded.messages[0]!), 'THE_PROMPT')
 })
 
 test('ensureFreeLaneShape injects gate tools into toolless chat bodies', () => {
